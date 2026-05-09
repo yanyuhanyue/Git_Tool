@@ -344,6 +344,9 @@ class GitGuiApp(tk.Tk):
         return {
             "init": {"label": "初始化仓库", "method": "git_init"},
             "clone_repo": {"label": "克隆仓库", "method": "git_clone_repo"},
+            "add_remote": {"label": "添加远程 origin", "method": "git_add_remote"},
+            "config_user": {"label": "配置用户名邮箱", "method": "git_config_user"},
+            "edit_user": {"label": "修改用户名邮箱", "method": "git_edit_user"},
             "generate_ignore": {"label": "生成忽略文件", "method": "git_generate_ignore"},
             "edit_ignore": {"label": "修改忽略文件", "method": "git_edit_ignore"},
             "status": {"label": "查看状态", "method": "git_status"},
@@ -357,14 +360,15 @@ class GitGuiApp(tk.Tk):
             "checkout_commit": {"label": "切换到指定版本", "method": "git_checkout_commit_by_input"},
             "all_branches": {"label": "查看所有分支", "method": "git_show_all_branches"},
             "create_branch": {"label": "创建分支", "method": "git_create_branch"},
+            "rename_default_branch": {"label": "修改默认分支名称", "method": "git_rename_default_branch"},
             "commit_some_to_branch": {"label": "提交部分文件到指定分支", "method": "git_commit_some_to_branch"},
             "commit_all_to_branch": {"label": "提交全部文件到指定分支", "method": "git_commit_all_to_branch"},
             "remote": {"label": "查看远程仓库", "method": "git_remote"},
-            "add_remote": {"label": "添加远程 origin", "method": "git_add_remote"},
             "set_remote": {"label": "修改远程仓库", "method": "git_set_remote"},
             "restore_files": {"label": "恢复指定文件到旧版本", "method": "git_restore_files"},
             "checkout_branch": {"label": "切回指定分支", "method": "git_checkout_branch"},
             "current_branch": {"label": "查看当前分支", "method": "git_current_branch"},
+            "fix_line_endings": {"label": "修复换行符警告", "method": "git_fix_line_endings_windows"},
             "clear_output": {"label": "清空输出", "method": "clear_output"},
             "fix_chinese": {"label": "修复中文显示", "method": "git_fix_chinese"},
         }
@@ -375,6 +379,9 @@ class GitGuiApp(tk.Tk):
         order = [
             "clone_repo",
             "init",
+            "add_remote",
+            "config_user",
+            "edit_user",
             "generate_ignore",
             "edit_ignore",
             "status",
@@ -388,14 +395,15 @@ class GitGuiApp(tk.Tk):
             "checkout_commit",
             "all_branches",
             "create_branch",
+            "rename_default_branch",
             "commit_some_to_branch",
             "commit_all_to_branch",
             "remote",
-            "add_remote",
             "set_remote",
             "restore_files",
             "checkout_branch",
             "current_branch",
+            "fix_line_endings",
             "fix_chinese",
             "clear_output",
         ]
@@ -410,10 +418,14 @@ class GitGuiApp(tk.Tk):
         default_hidden_actions = {
             "all_branches",
             "create_branch",
+            "rename_default_branch",
             "commit_some_to_branch",
             "commit_all_to_branch",
             "remote",
             "set_remote",
+            "config_user",
+            "edit_user",
+            "fix_line_endings",
         }
         return action_id not in default_hidden_actions
 
@@ -1254,8 +1266,12 @@ obj/
         self.output.config(yscrollcommand=scrollbar.set)
 
         self.output.tag_config("normal_text", foreground="black", underline=False)
+        self.output.tag_config("warning_text", foreground="#7a4b00", background="#fff3a3", underline=False)
+        self.output.tag_config("error_text", foreground="#b00020", background="#ffd6d6", underline=False)
         self.output.tag_config("commit_link", foreground="blue", underline=True)
         self.output.tag_raise("commit_link", "normal_text")
+        self.output.tag_raise("commit_link", "warning_text")
+        self.output.tag_raise("commit_link", "error_text")
 
         self.output.tag_bind("commit_link", "<Enter>", self.enter_commit_link)
         self.output.tag_bind("commit_link", "<Leave>", self.leave_commit_link)
@@ -1389,6 +1405,24 @@ obj/
                     moved_item = self.button_layout.pop(index)
                     self.button_layout.insert(0, moved_item)
                     changed = True
+
+                # “添加远程 origin”自动显示时，固定放在“初始化仓库”后面。
+                if visible and action_id == "add_remote":
+                    current_index = self.find_layout_index_by_key("builtin:add_remote")
+                    init_index = self.find_layout_index_by_key("builtin:init")
+
+                    if current_index is not None and init_index is not None:
+                        moved_item = self.button_layout.pop(current_index)
+
+                        # 如果 add_remote 原本在 init 前面，pop 后 init 的位置会左移一位，需要重新查找。
+                        init_index = self.find_layout_index_by_key("builtin:init")
+                        insert_index = init_index + 1 if init_index is not None else len(self.button_layout)
+
+                        if current_index != insert_index:
+                            self.button_layout.insert(insert_index, moved_item)
+                            changed = True
+                        else:
+                            self.button_layout.insert(current_index, moved_item)
 
                 break
 
@@ -3131,6 +3165,7 @@ obj/
         self.show_builtin_if_exists("init")
         self.show_builtin_if_exists("add_remote")
         self.update_ignore_buttons_by_repo()
+        self.update_user_config_buttons_by_repo()
 
         self.show_connect_github_dialog_for_non_git()
 
@@ -3164,6 +3199,44 @@ obj/
             self.show_builtin_if_exists("fix_chinese")
 
         self.update_ignore_buttons_by_repo()
+        self.update_user_config_buttons_by_repo()
+
+    def add_remote_origin_from_connect_dialog(self):
+        repo = self.get_repo()
+
+        if not repo:
+            return
+
+        inside_output = self.run_command(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            repo
+        ).strip()
+
+        if inside_output.lower() != "true":
+            should_init = messagebox.askyesno(
+                "需要先初始化 Git 仓库",
+                "当前目录还不是 Git 仓库，不能直接添加远程 origin。\n\n"
+                "是否先执行 git init 初始化仓库，然后再添加远程 origin？"
+            )
+
+            if not should_init:
+                return
+
+            self.append_output("\n========== 初始化 Git 仓库 ==========\n")
+            self.append_output("默认分支：main\n\n")
+
+            code, output = self.run_git_init_main_sync(repo)
+            self.append_output(output)
+
+            if code != 0:
+                messagebox.showerror("错误", "初始化 Git 仓库失败，无法继续添加远程 origin。")
+                self.status_text.set("初始化 Git 仓库失败：请查看红色错误提示")
+                return
+
+            self.update_first_commit_step_status(repo, command_success=True, command_title="初始化仓库")
+            self.status_text.set("初始化仓库成功。继续添加远程 origin")
+
+        self.git_add_remote()
 
     def show_connect_github_dialog_for_git_no_remote(self):
         dialog = tk.Toplevel(self)
@@ -3193,7 +3266,12 @@ obj/
             webbrowser.open("https://github.com/new")
             dialog.destroy()
 
+        def add_remote_origin():
+            dialog.destroy()
+            self.add_remote_origin_from_connect_dialog()
+
         ttk.Button(btn_frame, text="打开 GitHub", command=open_github).pack(side="left", padx=(0, 8))
+        ttk.Button(btn_frame, text="添加远程 origin", command=add_remote_origin).pack(side="left", padx=(0, 8))
         ttk.Button(btn_frame, text="取消", command=dialog.destroy).pack(side="left")
 
         dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
@@ -3231,8 +3309,13 @@ obj/
             dialog.destroy()
             self.git_clone_repo()
 
+        def add_remote_origin():
+            dialog.destroy()
+            self.add_remote_origin_from_connect_dialog()
+
         ttk.Button(btn_frame, text="打开 GitHub", command=open_github).pack(side="left", padx=(0, 8))
         ttk.Button(btn_frame, text="克隆仓库", command=clone_repo).pack(side="left", padx=(0, 8))
+        ttk.Button(btn_frame, text="添加远程 origin", command=add_remote_origin).pack(side="left", padx=(0, 8))
         ttk.Button(btn_frame, text="取消", command=dialog.destroy).pack(side="left")
 
         dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
@@ -3382,10 +3465,78 @@ obj/
         self.status_text.set("命令执行中...")
 
         def task():
-            output = self.run_command(["git"] + git_args, repo)
-            self.after(0, lambda: self.finish_command(output))
+            code, output = self.run_command_with_code(["git"] + git_args, repo)
+            self.after(0, lambda: self.finish_command_with_code(output, code, repo, title))
 
         threading.Thread(target=task, daemon=True).start()
+
+    def finish_command_with_code(self, output, code, repo=None, title="执行命令"):
+        self.append_output(output)
+
+        if code == 0:
+            self.update_first_commit_step_status(repo, command_success=True, command_title=title)
+        else:
+            self.status_text.set(f"{title}失败：请查看红色错误提示，修正后重试")
+
+    def is_inside_git_repo(self, repo):
+        if not repo or not Path(repo).exists():
+            return False
+
+        output = self.run_command(["git", "rev-parse", "--is-inside-work-tree"], repo).strip()
+        return output.lower() == "true"
+
+    def repo_has_staged_changes(self, repo):
+        if not self.is_inside_git_repo(repo):
+            return False
+
+        output = self.run_command(["git", "diff", "--cached", "--name-only"], repo).strip()
+        return bool(output)
+
+    def update_first_commit_step_status(self, repo=None, command_success=True, command_title="命令"):
+        """
+        左下角流程提示：
+        新仓库第一次提交流程中，每完成一步都提示是否成功以及下一步做什么。
+        """
+        if repo is None:
+            repo = self.get_repo_silent()
+
+        if not command_success:
+            self.status_text.set(f"{command_title}失败：请查看红色错误提示，修正后重试")
+            return
+
+        if not repo or not Path(repo).exists():
+            self.status_text.set(f"{command_title}成功")
+            return
+
+        if not self.is_inside_git_repo(repo):
+            self.status_text.set(f"{command_title}成功。下一步：初始化仓库或克隆仓库")
+            return
+
+        has_commits = self.repo_has_commits(repo)
+        has_origin = self.repo_has_origin_remote(repo)
+
+        if not has_commits:
+            if self.repo_has_staged_changes(repo):
+                self.status_text.set(f"{command_title}成功。新仓库下一步：点击“添加说明”，完成第一次提交")
+            else:
+                self.status_text.set(f"{command_title}成功。新仓库下一步：点击“添加全部文件”或“添加部分文件”")
+            return
+
+        if not has_origin:
+            self.status_text.set(f"{command_title}成功。第一次提交已完成，下一步：点击“添加远程 origin”")
+            return
+
+        branch = self.get_current_branch_for_push(repo)
+        upstream = self.run_command(
+            ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+            repo
+        ).strip()
+
+        if branch and ("fatal" in upstream.lower() or upstream == ""):
+            self.status_text.set(f"{command_title}成功。下一步：点击“推送至仓库”，首次绑定远程分支")
+            return
+
+        self.status_text.set(f"{command_title}成功。当前仓库已提交并连接远程，可正常推送或拉取")
 
     def run_git_sequence(self, commands, title="执行多个 Git 命令"):
         repo = self.get_repo()
@@ -3423,10 +3574,52 @@ obj/
 
     def finish_command(self, output):
         self.append_output(output)
-        self.status_text.set("命令执行完成")
+        self.update_first_commit_step_status(self.get_repo_silent(), command_success=True, command_title="命令")
+
+    def is_error_line(self, line):
+        lower_line = line.lower()
+        error_patterns = [
+            "error:",
+            "fatal:",
+            "failed:",
+            "cannot ",
+            "unable to ",
+            "refusing to ",
+            "permission denied",
+            "authentication failed",
+        ]
+
+        return any(pattern in lower_line for pattern in error_patterns)
+
+    def is_warning_line(self, line):
+        lower_line = line.lower()
+        warning_patterns = [
+            "warning:",
+            "lf will be replaced by crlf",
+            "crlf will be replaced by lf",
+        ]
+
+        return any(pattern in lower_line for pattern in warning_patterns)
 
     def append_output(self, text):
-        self.output.insert("end-1c", text, ("normal_text",))
+        has_warning = False
+        has_error = False
+
+        for chunk in text.splitlines(True):
+            if self.is_error_line(chunk):
+                self.output.insert("end-1c", chunk, ("error_text",))
+                has_error = True
+            elif self.is_warning_line(chunk):
+                self.output.insert("end-1c", chunk, ("warning_text",))
+                has_warning = True
+            else:
+                self.output.insert("end-1c", chunk, ("normal_text",))
+
+        if has_error:
+            self.status_text.set("检测到 error / fatal，已用红色高亮显示")
+        elif has_warning:
+            self.status_text.set("检测到 warning，已用黄色高亮显示")
+
         self.output.see("end")
 
     def clear_output(self):
@@ -3502,8 +3695,266 @@ obj/
     # Git 功能
     # ============================================================
 
+    # ============================================================
+    # Git 用户名和邮箱配置
+    # ============================================================
+
+    def get_git_identity(self, repo=None):
+        """
+        获取当前有效的 Git 用户名和邮箱。
+        在 Git 仓库里会读取 local + global 的最终结果；
+        在普通目录里通常读取 global 配置。
+        """
+        if repo is None:
+            repo = self.get_repo_silent()
+
+        cwd = repo if repo and Path(repo).exists() else str(Path.home())
+
+        name = self.run_command(["git", "config", "--get", "user.name"], cwd).strip()
+        email = self.run_command(["git", "config", "--get", "user.email"], cwd).strip()
+
+        if "error" in name.lower() or "fatal" in name.lower():
+            name = ""
+
+        if "error" in email.lower() or "fatal" in email.lower():
+            email = ""
+
+        return name, email
+
+    def is_git_identity_configured(self, repo=None):
+        name, email = self.get_git_identity(repo)
+        return bool(name.strip()) and bool(email.strip())
+
+    def update_user_config_buttons_by_repo(self):
+        repo = self.get_repo_silent()
+
+        if self.is_git_identity_configured(repo):
+            self.hide_builtin_if_exists("config_user")
+        else:
+            self.show_builtin_if_exists("config_user")
+
+        # “修改用户名邮箱”只作为可选高级按钮，默认隐藏，不自动显示。
+        # 用户需要时可从“显示隐藏”里手动打开。
+
+    def ask_git_identity_dialog(self, title="配置用户名邮箱", default_global=True):
+        repo = self.get_repo_silent()
+        current_name, current_email = self.get_git_identity(repo)
+
+        dialog = tk.Toplevel(self)
+        dialog.withdraw()
+        dialog.title(title)
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.attributes("-topmost", True)
+
+        result = {"ok": False, "name": "", "email": "", "use_global": True}
+
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(
+            frame,
+            text=(
+                "Git 第一次提交前需要配置用户名和邮箱。\n"
+                "这些信息会写入提交记录，用于标识是谁提交的。"
+            ),
+            justify="left"
+        ).pack(anchor="w", pady=(0, 12))
+
+        ttk.Label(frame, text="用户名 user.name：").pack(anchor="w")
+        name_var = tk.StringVar(value=current_name)
+        name_entry = ttk.Entry(frame, textvariable=name_var, width=48)
+        name_entry.pack(fill="x", pady=(4, 10))
+
+        ttk.Label(frame, text="邮箱 user.email：").pack(anchor="w")
+        email_var = tk.StringVar(value=current_email)
+        email_entry = ttk.Entry(frame, textvariable=email_var, width=48)
+        email_entry.pack(fill="x", pady=(4, 10))
+
+        use_global_var = tk.BooleanVar(value=default_global)
+
+        ttk.Checkbutton(
+            frame,
+            text="保存为全局配置（推荐：以后所有仓库都可使用）",
+            variable=use_global_var
+        ).pack(anchor="w", pady=(0, 12))
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill="x")
+
+        def ok():
+            name = name_var.get().strip()
+            email = email_var.get().strip()
+
+            if not name:
+                messagebox.showwarning("提示", "用户名不能为空")
+                return
+
+            if not email:
+                messagebox.showwarning("提示", "邮箱不能为空")
+                return
+
+            result["ok"] = True
+            result["name"] = name
+            result["email"] = email
+            result["use_global"] = bool(use_global_var.get())
+            dialog.destroy()
+
+        def cancel():
+            dialog.destroy()
+
+        ttk.Button(btn_frame, text="保存", command=ok).pack(side="left", padx=(0, 8))
+        ttk.Button(btn_frame, text="取消", command=cancel).pack(side="left")
+
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+
+        name_entry.focus_set()
+        self.center_dialog(dialog, min_width=480, min_height=330)
+        self.wait_window(dialog)
+
+        if not result["ok"]:
+            return None
+
+        return result
+
+    def save_git_identity(self, name, email, use_global=True):
+        repo = self.get_repo_silent()
+        cwd = repo if repo and Path(repo).exists() else str(Path.home())
+
+        if use_global:
+            name_args = ["config", "--global", "user.name", name]
+            email_args = ["config", "--global", "user.email", email]
+            title = "保存全局 Git 用户名和邮箱"
+        else:
+            if not repo:
+                messagebox.showwarning("提示", "当前没有可用仓库，无法保存为当前仓库配置")
+                return False
+
+            name_args = ["config", "user.name", name]
+            email_args = ["config", "user.email", email]
+            title = "保存当前仓库 Git 用户名和邮箱"
+
+        self.append_output(f"\n========== {title} ==========\n")
+
+        code1, out1 = self.run_command_with_code(["git"] + name_args, cwd)
+        code2, out2 = self.run_command_with_code(["git"] + email_args, cwd)
+
+        if out1.strip():
+            self.append_output(out1 + "\n")
+        if out2.strip():
+            self.append_output(out2 + "\n")
+
+        if code1 == 0 and code2 == 0:
+            self.append_output(f"已保存 user.name = {name}\n")
+            self.append_output(f"已保存 user.email = {email}\n")
+            self.status_text.set("Git 用户名和邮箱已配置")
+            self.update_user_config_buttons_by_repo()
+            return True
+
+        messagebox.showerror("错误", "保存 Git 用户名和邮箱失败，请检查 Git 是否安装正常。")
+        return False
+
+    def git_config_user(self):
+        result = self.ask_git_identity_dialog("配置用户名邮箱", default_global=True)
+
+        if not result:
+            return False
+
+        return self.save_git_identity(
+            result["name"],
+            result["email"],
+            result["use_global"]
+        )
+
+    def git_edit_user(self):
+        result = self.ask_git_identity_dialog("修改用户名邮箱", default_global=True)
+
+        if not result:
+            return False
+
+        return self.save_git_identity(
+            result["name"],
+            result["email"],
+            result["use_global"]
+        )
+
+    def ensure_git_identity_or_prompt(self):
+        repo = self.get_repo_silent()
+
+        if self.is_git_identity_configured(repo):
+            return True
+
+        should_config = messagebox.askyesno(
+            "需要配置用户名和邮箱",
+            "Git 第一次提交前需要配置 user.name 和 user.email。\n\n"
+            "是否现在配置？\n\n"
+            "建议保存为全局配置，这样以后所有仓库都可以直接提交。"
+        )
+
+        if not should_config:
+            self.show_builtin_if_exists("config_user")
+            return False
+
+        return bool(self.git_config_user())
+
+    def run_git_init_main_sync(self, repo):
+        """
+        初始化仓库时默认创建 main 分支。
+        优先使用：git init -b main
+        如果用户的 Git 版本较旧，不支持 -b，则回退：
+        git init
+        git symbolic-ref HEAD refs/heads/main
+        """
+        output_parts = []
+
+        output_parts.append("git init -b main\n")
+        code, output = self.run_command_with_code(["git", "init", "-b", "main"], repo)
+        output_parts.append(output)
+
+        if code == 0:
+            return 0, "".join(output_parts)
+
+        output_parts.append(
+            "\n当前 Git 可能不支持 git init -b main，尝试兼容方式初始化 main 分支。\n\n"
+        )
+
+        output_parts.append("git init\n")
+        code2, output2 = self.run_command_with_code(["git", "init"], repo)
+        output_parts.append(output2)
+
+        if code2 != 0:
+            return code2, "".join(output_parts)
+
+        output_parts.append("git symbolic-ref HEAD refs/heads/main\n")
+        code3, output3 = self.run_command_with_code(
+            ["git", "symbolic-ref", "HEAD", "refs/heads/main"],
+            repo
+        )
+        output_parts.append(output3)
+
+        return code3, "".join(output_parts)
+
     def git_init(self):
-        self.run_git(["init"], "初始化 Git 仓库")
+        repo = self.get_repo()
+        if not repo:
+            return
+
+        self.append_output("\n========== 初始化 Git 仓库 ==========\n")
+        self.status_text.set("正在初始化 Git 仓库，默认分支为 main...")
+
+        def task():
+            code, output = self.run_git_init_main_sync(repo)
+
+            if code == 0:
+                output += "\n初始化完成：默认分支已设置为 main。\n"
+            else:
+                output += "\n初始化失败，请查看上方红色错误提示。\n"
+
+            self.after(0, lambda: self.finish_command_with_code(output, code, repo, "初始化仓库"))
+            self.after(1000, self.check_repo_after_choose)
+
+        threading.Thread(target=task, daemon=True).start()
 
     def git_clone_repo(self):
         repo = self.get_repo()
@@ -3610,6 +4061,9 @@ obj/
         self.run_git(["add", "--"] + relative_paths, "添加部分文件")
 
     def git_commit(self):
+        if not self.ensure_git_identity_or_prompt():
+            return
+
         msg = self.ask_text_with_menu("添加说明", "请输入本次提交说明：")
 
         if msg is None:
@@ -3622,27 +4076,159 @@ obj/
 
         self.run_git(["commit", "-m", msg], "添加说明并提交")
 
+    def repo_has_commits(self, repo):
+        code, _ = self.run_command_with_code(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            repo
+        )
+        return code == 0
+
+    def repo_has_origin_remote(self, repo):
+        remote_output = self.run_command(["git", "remote"], repo).strip()
+        return "origin" in remote_output.split()
+
+    def get_current_branch_for_push(self, repo):
+        branch = self.run_command(["git", "symbolic-ref", "--short", "HEAD"], repo).strip()
+
+        if branch and "fatal" not in branch.lower():
+            return branch
+
+        branch = self.run_command(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo).strip()
+
+        if branch and "fatal" not in branch.lower() and branch != "HEAD":
+            return branch
+
+        return ""
+
+    def build_new_repo_push_guide(self, has_origin):
+        if has_origin:
+            remote_step = "4. 点击“推送至仓库”，工具会自动执行首次推送并绑定远程分支"
+        else:
+            remote_step = "4. 点击“添加远程 origin”，粘贴 GitHub 仓库地址\n5. 点击“推送至仓库”，工具会自动执行首次推送并绑定远程分支"
+
+        return (
+            "检测到当前仓库还没有任何提交记录，因此不能直接推送。\n"
+            "请按需生成忽略文件，随后点击“添加全部文件”或“添加部分文件”。\n\n"
+            "新仓库标准操作步骤：\n"
+            "1. 先确认是否需要“生成忽略文件”，例如 UE5 / Unity 项目建议先生成 .gitignore\n"
+            "2. 点击“添加全部文件”或“添加部分文件”\n"
+            "3. 点击“添加说明”，填写本次提交说明并完成第一次提交\n"
+            f"{remote_step}\n\n"
+            "说明：GitHub 只能接收已经提交过的内容，空仓库直接推送会报错。"
+        )
+
+    def show_new_repo_push_guide(self, has_origin):
+        message = self.build_new_repo_push_guide(has_origin)
+
+        self.append_output("\n========== 新仓库推送提示 ==========\n")
+        self.append_output(message + "\n")
+        self.status_text.set("新仓库需要先提交一次再推送")
+        messagebox.showinfo("新仓库推送提示", message)
+
+    def show_existing_repo_no_origin_guide(self):
+        message = (
+            "检测到当前仓库已经有提交记录，但还没有添加远程 origin。\n\n"
+            "标准操作步骤：\n"
+            "1. 点击“添加远程 origin”\n"
+            "2. 粘贴 GitHub 仓库地址，例如：https://github.com/用户名/仓库名.git\n"
+            "3. 再点击“推送至仓库”\n\n"
+            "工具会自动判断是否是第一次推送，并在首次推送时自动绑定远程上游分支。"
+        )
+
+        self.append_output("\n========== 缺少远程 origin ==========\n")
+        self.append_output(message + "\n")
+        self.status_text.set("缺少远程 origin")
+        messagebox.showinfo("缺少远程 origin", message)
+
+    def is_push_rejected_fetch_first(self, output):
+        lower_output = output.lower()
+
+        patterns = [
+            "[rejected]",
+            "fetch first",
+            "failed to push some refs",
+            "updates were rejected because the remote contains work that you do not",
+            "have locally",
+            "use 'git pull' before pushing again",
+            "use \"git pull\" before pushing again",
+        ]
+
+        return (
+            ("fetch first" in lower_output or "failed to push some refs" in lower_output)
+            and any(pattern in lower_output for pattern in patterns)
+        )
+
+    def handle_push_rejected_fetch_first(self, repo, branch, output):
+        message = (
+            "推送被 GitHub 拒绝：远程仓库包含本地没有的提交。\\n\\n"
+            "这通常出现在：\\n"
+            "1. GitHub 仓库创建时勾选了 README / .gitignore / License\\n"
+            "2. 其他电脑或其他成员已经先推送过内容\\n"
+            "3. 远程 main 分支比本地 main 分支更新\\n\\n"
+            "标准处理步骤：\\n"
+            "1. 先点击“拉取”，把 GitHub 上的内容拉到本地\\n"
+            "2. 如果出现冲突，先解决冲突，再执行“添加全部文件”→“添加说明”\\n"
+            "3. 再点击“推送至仓库”\\n\\n"
+            "推荐命令：git pull --rebase origin "
+            f"{branch}\\n"
+        )
+
+        self.append_output("\\n========== 推送被拒绝：需要先拉取 ==========\n")
+        self.append_output(message + "\\n")
+        self.status_text.set("推送失败：远程有本地没有的提交，下一步先点击“拉取”")
+
+        should_pull = messagebox.askyesno(
+            "推送被拒绝：需要先拉取",
+            message + "\\n是否现在自动执行 git pull --rebase？"
+        )
+
+        if should_pull:
+            self.run_git(["pull", "--rebase", "origin", branch], "拉取远程更新并变基")
+
+    def handle_push_failure(self, repo, branch, output):
+        if self.is_push_rejected_fetch_first(output):
+            self.handle_push_rejected_fetch_first(repo, branch, output)
+            return
+
+        self.status_text.set("推送至仓库失败：请查看红色错误提示，修正后重试")
+
     def git_smart_push(self):
         repo = self.get_repo()
         if not repo:
             return
 
         self.append_output("\n========== 推送至仓库 ==========\n")
-        self.status_text.set("正在检测是否首次推送...")
+        self.status_text.set("正在判断仓库状态...")
 
         def task():
-            branch = self.run_command(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo).strip()
+            inside_output = self.run_command(
+                ["git", "rev-parse", "--is-inside-work-tree"],
+                repo
+            ).strip()
 
-            if not branch or "fatal" in branch.lower():
-                self.after(0, lambda: messagebox.showerror("错误", "无法获取当前分支名，请确认这是 Git 仓库。"))
-                self.after(0, lambda: self.status_text.set("无法获取当前分支"))
+            if inside_output.lower() != "true":
+                self.after(0, lambda: messagebox.showerror("错误", "当前目录不是 Git 仓库，请先初始化仓库或克隆仓库。"))
+                self.after(0, lambda: self.status_text.set("当前目录不是 Git 仓库"))
                 return
 
-            remote = self.run_command(["git", "remote"], repo).strip()
+            has_commits = self.repo_has_commits(repo)
+            has_origin = self.repo_has_origin_remote(repo)
 
-            if "origin" not in remote.split():
-                self.after(0, lambda: messagebox.showwarning("提示", "当前仓库还没有 origin 远程仓库，请先添加远程 origin。"))
-                self.after(0, lambda: self.status_text.set("缺少远程 origin"))
+            # 新仓库：没有任何提交，直接 push 一定会失败，因此只给标准操作步骤。
+            if not has_commits:
+                self.after(0, lambda: self.show_new_repo_push_guide(has_origin))
+                return
+
+            # 有提交但没有远程 origin：提示先添加远程。
+            if not has_origin:
+                self.after(0, self.show_existing_repo_no_origin_guide)
+                return
+
+            branch = self.get_current_branch_for_push(repo)
+
+            if not branch:
+                self.after(0, lambda: messagebox.showerror("错误", "无法获取当前分支名，请确认这是正常的 Git 分支。"))
+                self.after(0, lambda: self.status_text.set("无法获取当前分支"))
                 return
 
             upstream = self.run_command(
@@ -3653,13 +4239,23 @@ obj/
             if "fatal" in upstream.lower() or upstream == "":
                 args = ["push", "-u", "origin", branch]
                 title = f"首次推送并绑定远程分支：{branch}"
+                message = (
+                    f"检测到当前分支“{branch}”已有提交，但还没有绑定远程上游分支。\n\n"
+                    f"将执行首次推送：git push -u origin {branch}\n\n"
+                    "之后再点击“推送至仓库”时，就会自动使用普通 git push。"
+                )
+                self.after(0, lambda: self.append_output(message + "\n\n"))
             else:
                 args = ["push"]
                 title = "推送到已绑定远程分支"
 
-            output = self.run_command(["git"] + args, repo)
-            self.after(0, lambda: self.append_output(f"git {' '.join(args)}\n\n{output}"))
-            self.after(0, lambda: self.status_text.set("推送命令执行完成"))
+            code, output = self.run_command_with_code(["git"] + args, repo)
+            self.after(0, lambda: self.append_output(f"--- {title} ---\ngit {' '.join(args)}\n\n{output}"))
+
+            if code == 0:
+                self.after(0, lambda: self.update_first_commit_step_status(repo, True, "推送至仓库"))
+            else:
+                self.after(0, lambda: self.handle_push_failure(repo, branch, output))
 
         threading.Thread(target=task, daemon=True).start()
 
@@ -3691,16 +4287,49 @@ obj/
                 ))
                 return
 
+            has_commits = self.repo_has_commits(repo)
+            has_origin = self.repo_has_origin_remote(repo)
+
+            if not has_commits:
+                message = self.build_new_repo_push_guide(has_origin)
+                self.after(0, lambda: self.handle_sync_result(
+                    auto=auto,
+                    ok=False,
+                    message=message,
+                    upstream="",
+                    ahead=0,
+                    behind=0,
+                    detail=""
+                ))
+                return
+
             upstream_output = self.run_command(
                 ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
                 repo
             ).strip()
 
             if "fatal" in upstream_output.lower() or upstream_output == "":
+                if has_origin:
+                    message = (
+                        "当前分支已有提交，但还没有绑定远程上游分支。\n\n"
+                        "标准操作步骤：\n"
+                        "1. 点击“推送至仓库”\n"
+                        "2. 工具会自动执行首次推送并绑定远程分支\n"
+                        "3. 之后再次推送会自动使用普通 git push"
+                    )
+                else:
+                    message = (
+                        "当前分支已有提交，但还没有添加远程 origin。\n\n"
+                        "标准操作步骤：\n"
+                        "1. 点击“添加远程 origin”并粘贴 GitHub 仓库地址\n"
+                        "2. 点击“推送至仓库”\n"
+                        "3. 工具会自动执行首次推送并绑定远程分支"
+                    )
+
                 self.after(0, lambda: self.handle_sync_result(
                     auto=auto,
                     ok=False,
-                    message="当前分支还没有绑定远程上游分支。可点击“推送至仓库”进行首次推送。",
+                    message=message,
                     upstream="",
                     ahead=0,
                     behind=0,
@@ -3757,11 +4386,18 @@ obj/
 
     def handle_sync_result(self, auto, ok, message, upstream, ahead, behind, detail):
         if not ok:
-            self.status_text.set(message)
+            first_line = message.split("\n", 1)[0] if message else "检查同步失败"
+            self.status_text.set(first_line)
+
             if not auto:
                 self.append_output(message + "\n")
                 if detail:
                     self.append_output(detail + "\n")
+
+                # 对新仓库 / 未绑定远程等流程类提示，弹窗显示步骤更清晰。
+                if "标准操作步骤" in message or "新仓库标准操作步骤" in message:
+                    messagebox.showinfo("操作提示", message)
+
             return
 
         info = f"远程上游：{upstream}\n本地领先：{ahead} 个提交\n本地落后：{behind} 个提交\n"
@@ -3876,9 +4512,57 @@ obj/
         else:
             self.run_git(["branch", branch_name], f"创建分支：{branch_name}")
 
+    def git_rename_default_branch(self):
+        repo = self.get_repo()
+        if not repo:
+            return
+
+        if not self.is_inside_git_repo(repo):
+            messagebox.showwarning("提示", "当前目录不是 Git 仓库，请先初始化仓库。")
+            return
+
+        current_branch = self.get_current_branch_for_push(repo)
+        if not current_branch:
+            current_branch = "main"
+
+        new_branch = self.ask_text_with_menu(
+            "修改默认分支名称",
+            "请输入新的默认分支名称：\n建议使用 main",
+            current_branch
+        )
+
+        if new_branch is None:
+            return
+
+        new_branch = new_branch.strip()
+
+        if new_branch == "":
+            messagebox.showwarning("提示", "分支名称不能为空")
+            return
+
+        if " " in new_branch:
+            messagebox.showwarning("提示", "分支名称不能包含空格")
+            return
+
+        confirm = messagebox.askyesno(
+            "确认修改默认分支名称",
+            f"确定要把当前分支名称修改为：{new_branch} 吗？\n\n"
+            f"将执行：git branch -M {new_branch}\n\n"
+            f"如果远程 GitHub 默认分支还不是 {new_branch}，"
+            f"推送后还需要到 GitHub 仓库设置里确认默认分支。"
+        )
+
+        if not confirm:
+            return
+
+        self.run_git(["branch", "-M", new_branch], f"修改默认分支名称为 {new_branch}")
+
     def git_commit_some_to_branch(self):
         repo = self.get_repo()
         if not repo:
+            return
+
+        if not self.ensure_git_identity_or_prompt():
             return
 
         branch_name = self.ask_text_with_menu(
@@ -3952,6 +4636,9 @@ obj/
     def git_commit_all_to_branch(self):
         repo = self.get_repo()
         if not repo:
+            return
+
+        if not self.ensure_git_identity_or_prompt():
             return
 
         branch_name = self.ask_text_with_menu(
@@ -4039,6 +4726,91 @@ obj/
 
         self.run_git(["remote", "set-url", "origin", url], "修改远程仓库 origin")
         self.after(1200, self.check_repo_after_choose)
+
+    def git_fix_line_endings_windows(self):
+        repo = self.get_repo()
+        if not repo:
+            return
+
+        if not Path(repo).exists():
+            messagebox.showerror("错误", "当前仓库路径不存在")
+            return
+
+        message = (
+            "该功能用于修复 Windows 下常见提示：\n\n"
+            "warning: LF will be replaced by CRLF the next time Git touches it\n\n"
+            "处理方式：\n"
+            "1. 在当前仓库写入 / 更新 .gitattributes\n"
+            "2. 将 Python、C/C++、UE/Unity 常见文本文件统一按 LF 保存\n"
+            "3. 将 .bat、.cmd、.ps1、.sln 等 Windows 文件按 CRLF 保存\n"
+            "4. 当前仓库设置 core.autocrlf=false，由 .gitattributes 接管换行符规则\n\n"
+            "是否继续？"
+        )
+
+        if not messagebox.askyesno("修复 Windows 换行符警告", message):
+            return
+
+        gitattributes_path = Path(repo) / ".gitattributes"
+
+        block = """\n# ===== Git GUI Tool line ending rules BEGIN =====\n# Cross-platform line ending rules for Windows development\n* text=auto\n\n# Source code / scripts usually keep LF\n*.py text eol=lf\n*.c text eol=lf\n*.h text eol=lf\n*.cpp text eol=lf\n*.hpp text eol=lf\n*.cs text eol=lf\n*.java text eol=lf\n*.js text eol=lf\n*.ts text eol=lf\n*.json text eol=lf\n*.uproject text eol=lf\n*.uplugin text eol=lf\n*.ini text eol=lf\n*.md text eol=lf\n*.txt text eol=lf\n\n# Windows command/project files keep CRLF\n*.bat text eol=crlf\n*.cmd text eol=crlf\n*.ps1 text eol=crlf\n*.sln text eol=crlf\n*.vcxproj text eol=crlf\n*.vcxproj.filters text eol=crlf\n\n# Binary files\n*.png binary\n*.jpg binary\n*.jpeg binary\n*.gif binary\n*.ico binary\n*.uasset binary\n*.umap binary\n*.fbx binary\n*.wav binary\n*.mp3 binary\n*.mp4 binary\n*.zip binary\n*.7z binary\n*.rar binary\n# ===== Git GUI Tool line ending rules END =====\n"""
+
+        try:
+            if gitattributes_path.exists():
+                old_text = gitattributes_path.read_text(encoding="utf-8", errors="replace")
+
+                if "# ===== Git GUI Tool line ending rules BEGIN =====" not in old_text:
+                    new_text = old_text.rstrip() + "\n" + block
+                    gitattributes_path.write_text(new_text, encoding="utf-8")
+            else:
+                gitattributes_path.write_text(block.lstrip(), encoding="utf-8")
+
+        except Exception as e:
+            messagebox.showerror("错误", f"写入 .gitattributes 失败：\n{e}")
+            return
+
+        self.append_output("\n========== 修复 Windows 换行符警告 ==========\n")
+        self.append_output(f"已更新：{gitattributes_path}\n")
+
+        # 当前仓库使用 .gitattributes 接管换行符，避免 Git 自动按全局 autocrlf 反复提示。
+        code1, output1 = self.run_command_with_code(["git", "config", "core.autocrlf", "false"], repo)
+        code2, output2 = self.run_command_with_code(["git", "config", "core.safecrlf", "false"], repo)
+
+        self.append_output("git config core.autocrlf false\n")
+        if output1.strip():
+            self.append_output(output1 + "\n")
+
+        self.append_output("git config core.safecrlf false\n")
+        if output2.strip():
+            self.append_output(output2 + "\n")
+
+        if code1 != 0 or code2 != 0:
+            messagebox.showwarning(
+                "提示",
+                "换行符规则文件已写入，但 Git 配置命令可能没有全部执行成功。\n请查看输出区域。"
+            )
+            return
+
+        do_renormalize = messagebox.askyesno(
+            "是否重新规范化已跟踪文件",
+            "是否现在执行：git add --renormalize . ？\n\n"
+            "建议：\n"
+            "1. 如果你准备马上提交本次换行符修复，选择“是”\n"
+            "2. 如果你只想先写入规则，稍后再处理，选择“否”\n\n"
+            "执行后可继续点击“添加说明”提交。"
+        )
+
+        if do_renormalize:
+            self.run_git(["add", "--renormalize", "."], "重新规范化换行符")
+        else:
+            self.append_output(
+                "\n已完成基础修复。\n"
+                "后续标准操作：\n"
+                "1. 点击“添加全部文件”\n"
+                "2. 点击“添加说明”\n"
+                "3. 点击“推送至仓库”\n"
+            )
+
+        self.status_text.set("Windows 换行符警告修复已完成")
 
     def git_fix_chinese(self):
         self.run_git(["config", "--global", "core.quotepath", "false"], "修复中文显示")
