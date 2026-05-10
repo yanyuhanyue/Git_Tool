@@ -112,6 +112,11 @@ class GitGuiApp(tk.Tk):
             # 直接记住上次关闭软件时的精简/标准模式
             "remember_simple_mode": True,
             "simple_mode": True,
+
+            # 一键上传中断后默认从中断处继续
+            # resume：优先继续暂存区 / 未推送提交
+            # restart：从头开始，必要时先清空暂存区
+            "one_click_resume_policy": "resume",
         }
 
         if not self.CONFIG_PATH.exists():
@@ -1273,7 +1278,10 @@ obj/
         ttk.Button(nav_frame, text="导入布局", command=self.import_layout).pack(side="left", padx=(0, 8), pady=2)
         ttk.Button(nav_frame, text="重置布局", command=self.reset_layout).pack(side="left", padx=(0, 8), pady=2)
 
-        # 放在导航栏最右边：用于恢复所有“以后不再提示 / 记住选择”的弹窗设置
+        # 右上角设置入口
+        ttk.Button(nav_frame, text="⚙️", width=4, command=self.open_settings_dialog).pack(side="right", padx=(8, 0), pady=2)
+
+        # 放在导航栏右侧：用于恢复所有“以后不再提示 / 记住选择”的弹窗设置
         ttk.Button(nav_frame, text="初始化弹窗选择", command=self.reset_popup_choices).pack(side="right", padx=(8, 0), pady=2)
 
         top_frame = ttk.Frame(self, padding=10)
@@ -1471,6 +1479,75 @@ obj/
             self.status_text.set("已切换到标准模式，并自动记住本次选择")
 
         self.render_buttons()
+
+    def get_one_click_resume_policy(self):
+        policy = self.app_config.get("one_click_resume_policy", "resume")
+
+        if policy not in {"resume", "restart"}:
+            policy = "resume"
+
+        return policy
+
+    def open_settings_dialog(self):
+        dialog = tk.Toplevel(self)
+        dialog.withdraw()
+        dialog.title("设置")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.attributes("-topmost", True)
+
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(
+            frame,
+            text="一键上传到 GitHub：中断后如何继续",
+            font=("Microsoft YaHei UI", 10, "bold")
+        ).pack(anchor="w", pady=(0, 8))
+
+        policy_var = tk.StringVar(value=self.get_one_click_resume_policy())
+
+        ttk.Radiobutton(
+            frame,
+            text="从中断的地方继续操作（默认推荐）",
+            variable=policy_var,
+            value="resume"
+        ).pack(anchor="w", pady=3)
+
+        ttk.Radiobutton(
+            frame,
+            text="每次都从头开始（必要时先清空暂存区）",
+            variable=policy_var,
+            value="restart"
+        ).pack(anchor="w", pady=3)
+
+        ttk.Label(
+            frame,
+            text=(
+                "\n说明：\n"
+                "如果你上次一键上传时已经添加文件但没有提交，选择“继续”会直接从添加说明开始。\n"
+                "如果你上次已经提交但没有推送，选择“继续”会直接从推送开始。\n"
+                "选择“从头开始”会重新选择要添加的文件。"
+            ),
+            justify="left"
+        ).pack(anchor="w", pady=(8, 12))
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill="x")
+
+        def save():
+            self.app_config["one_click_resume_policy"] = policy_var.get()
+            self.save_app_config()
+            self.status_text.set("设置已保存")
+            dialog.destroy()
+
+        ttk.Button(btn_frame, text="保存", command=save).pack(side="left", padx=(0, 8))
+        ttk.Button(btn_frame, text="取消", command=dialog.destroy).pack(side="left")
+
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        self.center_dialog(dialog, min_width=560, min_height=300)
+        self.wait_window(dialog)
 
     # ============================================================
     # 布局工具
@@ -3260,6 +3337,9 @@ obj/
         self.app_config["simple_mode"] = True
         self.simple_mode_var.set(True)
 
+        # 一键上传恢复默认：从中断处继续
+        self.app_config["one_click_resume_policy"] = "resume"
+
         self.save_app_config()
         self.render_buttons()
         self.status_text.set("已初始化弹窗选择，模式已恢复为默认精简模式")
@@ -4978,6 +5058,276 @@ obj/
 
         return ["add", "--"] + relative_paths, "添加部分文件（可包含删除文件）"
 
+    def parse_name_status_output(self, output):
+        result = []
+
+        for raw_line in output.splitlines():
+            if not raw_line.strip():
+                continue
+
+            parts = raw_line.split("\t")
+            status = parts[0].strip()
+
+            if status.startswith(("R", "C")) and len(parts) >= 3:
+                display_path = f"{parts[1]} -> {parts[2]}"
+                commit_path = parts[2]
+            elif len(parts) >= 2:
+                display_path = parts[1]
+                commit_path = parts[1]
+            else:
+                continue
+
+            result.append({
+                "status": status,
+                "path": display_path,
+                "commit_path": commit_path,
+                "is_deleted": status.startswith("D")
+            })
+
+        return result
+
+    def get_unstaged_tracked_statuses(self, repo):
+        """
+        获取工作区中已修改但未暂存的已跟踪文件。
+        """
+        code, output = self.run_command_with_code(
+            ["git", "diff", "--name-status"],
+            repo
+        )
+
+        if code != 0:
+            return []
+
+        return self.parse_name_status_output(output)
+
+    def get_untracked_files(self, repo):
+        """
+        获取尚未被 Git 跟踪、也没有被 .gitignore 忽略的文件。
+        """
+        code, output = self.run_command_with_code(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            repo
+        )
+
+        if code != 0:
+            return []
+
+        return [
+            line.strip()
+            for line in output.splitlines()
+            if line.strip()
+        ]
+
+    def get_ahead_behind_for_one_click(self, repo):
+        """
+        返回当前分支相对上游分支的 ahead / behind。
+        如果当前分支没有上游分支，has_upstream=False。
+        """
+        upstream = self.run_command(
+            ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+            repo
+        ).strip()
+
+        if "fatal" in upstream.lower() or upstream == "":
+            return {
+                "has_upstream": False,
+                "upstream": "",
+                "ahead": 0,
+                "behind": 0,
+            }
+
+        code, output = self.run_command_with_code(
+            ["git", "rev-list", "--left-right", "--count", "@{u}...HEAD"],
+            repo
+        )
+
+        if code != 0:
+            return {
+                "has_upstream": True,
+                "upstream": upstream,
+                "ahead": 0,
+                "behind": 0,
+            }
+
+        parts = output.strip().split()
+
+        if len(parts) >= 2:
+            behind = int(parts[0])
+            ahead = int(parts[1])
+        else:
+            behind = 0
+            ahead = 0
+
+        return {
+            "has_upstream": True,
+            "upstream": upstream,
+            "ahead": ahead,
+            "behind": behind,
+        }
+
+    def get_one_click_resume_state(self, repo):
+        """
+        分析一键上传当前应从哪一步继续：
+        1. 暂存区已有内容：可以从“添加说明 / 提交”继续；
+        2. 没有暂存内容，但本地有未推送提交：可以从“推送”继续；
+        3. 有未暂存 / 未跟踪内容：需要从添加文件开始。
+        """
+        staged_statuses = self.get_staged_file_statuses(repo) or []
+        unstaged_statuses = self.get_unstaged_tracked_statuses(repo)
+        untracked_files = self.get_untracked_files(repo)
+
+        has_commits = self.repo_has_commits(repo)
+        has_origin = self.repo_has_origin_remote(repo)
+        sync = self.get_ahead_behind_for_one_click(repo) if has_commits and has_origin else {
+            "has_upstream": False,
+            "upstream": "",
+            "ahead": 0,
+            "behind": 0,
+        }
+
+        has_worktree_changes = bool(staged_statuses or unstaged_statuses or untracked_files)
+        staged_matches_worktree = bool(staged_statuses) and not unstaged_statuses and not untracked_files
+
+        # 没有上游分支但已有提交和 origin，说明很可能完成了提交但还没首次推送。
+        has_unpushed_commits = bool(
+            has_commits
+            and has_origin
+            and (
+                (not sync.get("has_upstream", False))
+                or sync.get("ahead", 0) > 0
+            )
+        )
+
+        return {
+            "staged_statuses": staged_statuses,
+            "unstaged_statuses": unstaged_statuses,
+            "untracked_files": untracked_files,
+            "has_commits": has_commits,
+            "has_origin": has_origin,
+            "has_worktree_changes": has_worktree_changes,
+            "staged_matches_worktree": staged_matches_worktree,
+            "sync": sync,
+            "has_unpushed_commits": has_unpushed_commits,
+        }
+
+    def format_one_click_resume_state(self, state, max_items=10):
+        lines = []
+
+        staged = state.get("staged_statuses", [])
+        unstaged = state.get("unstaged_statuses", [])
+        untracked = state.get("untracked_files", [])
+
+        status_map = {
+            "A": "新增",
+            "M": "修改",
+            "D": "删除",
+            "R": "重命名",
+            "C": "复制",
+            "T": "类型变化",
+            "U": "未合并",
+        }
+
+        if staged:
+            lines.append(f"暂存区已有 {len(staged)} 个文件：")
+            for item in staged[:max_items]:
+                status = str(item.get("status", ""))
+                status_text = status_map.get(status[:1], status)
+                lines.append(f"- {status_text}：{item.get('path')}")
+
+            if len(staged) > max_items:
+                lines.append(f"... 还有 {len(staged) - max_items} 个暂存文件")
+
+        if unstaged:
+            lines.append(f"\n工作区还有 {len(unstaged)} 个未暂存的已跟踪文件：")
+            for item in unstaged[:max_items]:
+                status = str(item.get("status", ""))
+                status_text = status_map.get(status[:1], status)
+                lines.append(f"- {status_text}：{item.get('path')}")
+
+            if len(unstaged) > max_items:
+                lines.append(f"... 还有 {len(unstaged) - max_items} 个未暂存文件")
+
+        if untracked:
+            lines.append(f"\n工作区还有 {len(untracked)} 个未跟踪文件：")
+            for file_path in untracked[:max_items]:
+                lines.append(f"- 未跟踪：{file_path}")
+
+            if len(untracked) > max_items:
+                lines.append(f"... 还有 {len(untracked) - max_items} 个未跟踪文件")
+
+        return "\n".join(lines).strip()
+
+    def reset_staging_for_one_click(self, repo):
+        """
+        从头开始一键上传时清空暂存区，但不删除工作区文件。
+        """
+        self.append_output("\n========== 一键上传：从头开始，清空暂存区 ==========\n")
+        self.append_output("git reset\n\n")
+
+        code, output = self.run_command_with_code(["git", "reset"], repo)
+        self.append_output(output)
+
+        if code != 0:
+            self.handle_common_git_problem(output, "清空暂存区")
+            self.status_text.set("从头开始失败：清空暂存区失败")
+            return False
+
+        self.status_text.set("已清空暂存区，准备从头开始选择文件")
+        return True
+
+    def run_one_click_push_only(self, repo, tag_plan=None):
+        """
+        一键上传中断在“已提交但未推送”阶段时，直接从推送继续。
+        """
+        self.append_output("\n========== 一键上传：从推送步骤继续 ==========\n")
+        self.status_text.set("检测到本地已有未推送提交，正在继续推送...")
+
+        def task_push_only():
+            all_output = []
+
+            branch = self.get_current_branch_for_push(repo)
+            if not branch:
+                branch = "main"
+
+            upstream = self.run_command(
+                ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+                repo
+            ).strip()
+
+            if "fatal" in upstream.lower() or upstream == "":
+                push_args = ["push", "-u", "origin", branch]
+                push_title = f"首次推送并绑定远程分支：{branch}"
+            else:
+                push_args = ["push"]
+                push_title = "推送至仓库"
+
+            all_output.append(f"\n--- {push_title} ---\n")
+            all_output.append("git " + " ".join(push_args) + "\n")
+
+            push_code, push_output = self.run_command_with_code(["git"] + push_args, repo)
+            all_output.append(push_output)
+
+            if push_code == 0:
+                tag_ok = self.append_tag_push_after_successful_branch_push(repo, all_output, tag_plan)
+
+                self.after(0, lambda text="".join(all_output): self.append_output(text))
+
+                if tag_ok:
+                    if tag_plan and tag_plan.get("create_tag"):
+                        self.after(0, lambda: self.status_text.set("一键上传成功：未推送提交和版本标签已推送到 GitHub"))
+                        self.after(0, lambda: messagebox.showinfo("上传完成", "已从中断处继续，代码和版本标签都已推送到 GitHub。"))
+                    else:
+                        self.after(0, lambda: self.status_text.set("一键上传成功：未推送提交已推送到 GitHub"))
+                        self.after(0, lambda: messagebox.showinfo("上传完成", "已从中断处继续，未推送提交已推送到 GitHub。"))
+                else:
+                    self.after(0, lambda: self.status_text.set("代码已推送，但版本标签创建或推送失败"))
+                    self.after(0, lambda: messagebox.showwarning("标签推送失败", "代码已推送成功，但版本标签创建或推送失败，请查看输出区域。"))
+            else:
+                self.after(0, lambda text="".join(all_output): self.append_output(text))
+                self.after(0, lambda out=push_output, br=branch: self.handle_push_failure(repo, br, out))
+
+        threading.Thread(target=task_push_only, daemon=True).start()
+
     def git_one_click_upload_to_github(self):
         ok, info = self.check_git_available()
         if not ok:
@@ -4997,7 +5347,90 @@ obj/
         if not self.ensure_origin_for_simple_upload(repo):
             return
 
-        tag_plan = self.ask_workflow_tag_plan(repo)
+        resume_policy = self.get_one_click_resume_policy()
+        state = self.get_one_click_resume_state(repo)
+
+        # ------------------------------------------------------------
+        # 1. 暂存区已有内容：说明上次很可能中断在“已添加文件但未提交”阶段
+        # ------------------------------------------------------------
+        if state["staged_statuses"]:
+            if resume_policy == "resume":
+                detail = self.format_one_click_resume_state(state)
+
+                if state["staged_matches_worktree"]:
+                    self.append_output("\n========== 一键上传：从暂存区继续 ==========\n")
+                    self.append_output(
+                        "检测到暂存区已有文件，且暂存区内容与当前工作区一致。\n"
+                        "将跳过“添加文件”步骤，直接继续“添加说明 / 提交 / 推送”。\n\n"
+                    )
+                    self.append_output(detail + "\n")
+                    self.status_text.set("检测到中断的一键上传：从暂存区继续")
+                    continue_from_staged = True
+                else:
+                    message = (
+                        "检测到暂存区已有文件，可能是上次一键上传中断后留下的内容。\n\n"
+                        f"{detail}\n\n"
+                        "当前暂存区与工作区不完全一致：\n"
+                        "选择“是”：从暂存区继续，只提交已经暂存的内容\n"
+                        "选择“否”：从头开始，先清空暂存区，再重新选择要上传的文件"
+                    )
+
+                    continue_from_staged = messagebox.askyesno(
+                        "检测到未完成的一键上传",
+                        message
+                    )
+
+                if continue_from_staged:
+                    tag_plan = self.normalize_one_click_tag_plan(self.ask_workflow_tag_plan(repo))
+
+                    if tag_plan.get("cancel"):
+                        self.status_text.set("一键上传已取消")
+                        return
+
+                    self.finish_one_click_add_and_choose_commit_mode(
+                        repo,
+                        "从暂存区继续",
+                        0,
+                        "已跳过添加文件步骤：使用当前暂存区内容继续提交。\n",
+                        tag_plan
+                    )
+                    return
+
+            # “从头开始”或用户选择从头开始：清空暂存区，再继续下面的添加文件流程。
+            if not self.reset_staging_for_one_click(repo):
+                return
+
+            state = self.get_one_click_resume_state(repo)
+
+        # ------------------------------------------------------------
+        # 2. 没有暂存内容，但已有本地未推送提交：从推送步骤继续
+        # ------------------------------------------------------------
+        if state["has_unpushed_commits"] and not state["has_worktree_changes"]:
+            tag_plan = self.normalize_one_click_tag_plan(self.ask_workflow_tag_plan(repo))
+
+            if tag_plan.get("cancel"):
+                self.status_text.set("一键上传已取消")
+                return
+
+            self.run_one_click_push_only(repo, tag_plan)
+            return
+
+        # ------------------------------------------------------------
+        # 3. 没有任何可提交内容，也没有未推送提交
+        # ------------------------------------------------------------
+        if not state["has_worktree_changes"] and not state["has_unpushed_commits"]:
+            messagebox.showinfo(
+                "没有需要上传的内容",
+                "当前仓库没有检测到新增、修改、删除或未推送提交。\n\n"
+                "如果你刚刚修改了文件，请确认文件是否保存，或是否被 .gitignore 忽略。"
+            )
+            self.status_text.set("没有需要上传的内容")
+            return
+
+        # ------------------------------------------------------------
+        # 4. 正常从添加文件开始
+        # ------------------------------------------------------------
+        tag_plan = self.normalize_one_click_tag_plan(self.ask_workflow_tag_plan(repo))
 
         if tag_plan.get("cancel"):
             self.status_text.set("一键上传已取消")
@@ -5023,13 +5456,21 @@ obj/
                     repo,
                     add_title,
                     add_code,
-                    add_output
+                    add_output,
+                    tag_plan
                 )
             )
 
         threading.Thread(target=task_add, daemon=True).start()
 
-    def finish_one_click_add_and_choose_commit_mode(self, repo, add_title, add_code, add_output):
+    def finish_one_click_add_and_choose_commit_mode(self, repo, add_title, add_code, add_output, tag_plan=None):
+        if tag_plan is None:
+            tag_plan = getattr(self, "_pending_one_click_tag_plan", None)
+            if hasattr(self, "_pending_one_click_tag_plan"):
+                delattr(self, "_pending_one_click_tag_plan")
+
+        tag_plan = self.normalize_one_click_tag_plan(tag_plan)
+
         self.append_output(add_output)
 
         if add_code != 0:
@@ -5099,6 +5540,8 @@ obj/
         self.run_one_click_commit_and_push(repo, commit_commands, tag_plan)
 
     def run_one_click_commit_and_push(self, repo, commit_commands, tag_plan=None):
+        tag_plan = self.normalize_one_click_tag_plan(tag_plan)
+
         self.status_text.set("一键上传执行中：正在提交...")
 
         def task_commit_push():
@@ -6583,12 +7026,32 @@ jobs:
 
         return result
 
+    def normalize_one_click_tag_plan(self, tag_plan=None):
+        """
+        一键上传流程中，tag_plan 可能来自：
+        1. 工作流弹窗；
+        2. 从暂存区继续；
+        3. 旧版本流程或异常恢复流程。
+
+        这里统一兜底，防止 tag_plan 未传入导致流程卡住。
+        """
+        if not isinstance(tag_plan, dict):
+            tag_plan = {}
+
+        return {
+            "cancel": bool(tag_plan.get("cancel", False)),
+            "create_tag": bool(tag_plan.get("create_tag", False)),
+            "tag_name": str(tag_plan.get("tag_name", "") or ""),
+        }
+
     def append_tag_push_after_successful_branch_push(self, repo, all_output, tag_plan):
         """
         分支推送成功后，如果用户选择创建版本标签，则创建本地标签并推送到 origin。
         返回 True / False 表示标签步骤是否成功。
         """
-        if not tag_plan or not tag_plan.get("create_tag"):
+        tag_plan = self.normalize_one_click_tag_plan(tag_plan)
+
+        if not tag_plan.get("create_tag"):
             return True
 
         tag_name = tag_plan.get("tag_name", "").strip()
