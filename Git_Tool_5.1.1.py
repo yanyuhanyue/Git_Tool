@@ -4967,21 +4967,177 @@ obj/
 
         self.run_git(["add", "--"] + relative_paths, "添加部分文件")
 
+    def get_staged_files(self, repo):
+        """
+        获取已经添加到暂存区、等待提交的文件。
+        """
+        code, output = self.run_command_with_code(
+            ["git", "diff", "--cached", "--name-only"],
+            repo
+        )
+
+        if code != 0:
+            messagebox.showerror("错误", "获取暂存区文件失败，请查看输出区域。")
+            self.append_output(output)
+            return None
+
+        files = [
+            line.strip()
+            for line in output.splitlines()
+            if line.strip()
+        ]
+
+        return files
+
+    def ask_commit_message_mode(self, staged_files):
+        """
+        选择提交说明方式：
+        1. 所有文件统一添加一个提交说明；
+        2. 每个文件单独添加提交说明并分别提交。
+        """
+        dialog = tk.Toplevel(self)
+        dialog.withdraw()
+        dialog.title("选择添加说明方式")
+        dialog.resizable(True, True)
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.attributes("-topmost", True)
+
+        result = {"mode": None}
+
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(
+            frame,
+            text=(
+                f"当前暂存区共有 {len(staged_files)} 个文件等待提交。\n\n"
+                "请选择添加说明方式："
+            ),
+            justify="left"
+        ).pack(anchor="w", pady=(0, 10))
+
+        file_preview_frame = ttk.LabelFrame(frame, text="等待提交的文件", padding=8)
+        file_preview_frame.pack(fill="both", expand=True, pady=(0, 12))
+
+        listbox = tk.Listbox(file_preview_frame, height=8, font=("Consolas", 9))
+        listbox.grid(row=0, column=0, sticky="nsew")
+
+        y_scroll = ttk.Scrollbar(file_preview_frame, orient="vertical", command=listbox.yview)
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        listbox.configure(yscrollcommand=y_scroll.set)
+
+        file_preview_frame.rowconfigure(0, weight=1)
+        file_preview_frame.columnconfigure(0, weight=1)
+
+        for file_path in staged_files:
+            listbox.insert("end", file_path)
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill="x")
+
+        def choose(mode):
+            result["mode"] = mode
+            dialog.destroy()
+
+        ttk.Button(
+            btn_frame,
+            text="统一添加说明",
+            command=lambda: choose("single")
+        ).pack(side="left", padx=(0, 8))
+
+        ttk.Button(
+            btn_frame,
+            text="每个文件单独添加说明",
+            command=lambda: choose("separate")
+        ).pack(side="left", padx=(0, 8))
+
+        ttk.Button(
+            btn_frame,
+            text="取消",
+            command=lambda: choose(None)
+        ).pack(side="left")
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: choose(None))
+        self.center_dialog(dialog, min_width=620, min_height=380)
+        self.wait_window(dialog)
+
+        return result["mode"]
+
     def git_commit(self):
+        repo = self.get_repo()
+        if not repo:
+            return
+
         if not self.ensure_git_identity_or_prompt():
             return
 
-        msg = self.ask_text_with_menu("添加说明", "请输入本次提交说明：")
+        staged_files = self.get_staged_files(repo)
 
-        if msg is None:
+        if staged_files is None:
             return
 
-        msg = msg.strip()
-        if msg == "":
-            messagebox.showwarning("提示", "提交说明不能为空")
+        if not staged_files:
+            messagebox.showinfo(
+                "没有可提交的文件",
+                "当前暂存区没有文件，无法添加说明并提交。\n\n"
+                "请先点击“添加全部文件”或“添加部分文件”，再点击“添加说明”。"
+            )
+            self.status_text.set("没有可提交的暂存文件：请先添加文件")
             return
 
-        self.run_git(["commit", "-m", msg], "添加说明并提交")
+        mode = self.ask_commit_message_mode(staged_files)
+
+        if mode is None:
+            return
+
+        if mode == "single":
+            msg = self.ask_text_with_menu(
+                "统一添加说明",
+                "请输入本次提交说明："
+            )
+
+            if msg is None:
+                return
+
+            msg = msg.strip()
+            if msg == "":
+                messagebox.showwarning("提示", "提交说明不能为空")
+                return
+
+            self.run_git(["commit", "-m", msg], "统一添加说明并提交")
+            return
+
+        if mode == "separate":
+            commands = []
+
+            for file_path in staged_files:
+                default_msg = f"更新 {Path(file_path).name}"
+                msg = self.ask_text_with_menu(
+                    "每个文件单独添加说明",
+                    f"文件：{file_path}\n\n请输入该文件的提交说明：",
+                    default_msg
+                )
+
+                if msg is None:
+                    self.status_text.set("已取消按文件分别提交")
+                    return
+
+                msg = msg.strip()
+
+                if msg == "":
+                    messagebox.showwarning("提示", f"文件 {file_path} 的提交说明不能为空")
+                    return
+
+                commands.append((
+                    ["commit", "-m", msg, "--", file_path],
+                    f"提交文件：{file_path}"
+                ))
+
+            if not commands:
+                return
+
+            self.run_git_sequence(commands, "每个文件单独添加说明并提交")
 
     def repo_has_commits(self, repo):
         code, _ = self.run_command_with_code(
