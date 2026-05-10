@@ -5172,6 +5172,65 @@ obj/
     def git_pull(self):
         self.run_git(["pull"], "拉取")
 
+    def format_remote_changed_files_detail(self, name_status_output):
+        """
+        将 git diff --name-status HEAD..@{u} 输出汉化。
+        用于本地落后 GitHub 时显示：远程版本到底改了哪些文件。
+        """
+        if not name_status_output or not name_status_output.strip():
+            return "未检测到具体文件差异。"
+
+        status_map = {
+            "A": "远程新增",
+            "M": "远程修改",
+            "D": "远程删除",
+            "R": "远程重命名",
+            "C": "远程复制",
+            "T": "类型变化",
+            "U": "未合并",
+        }
+
+        lines = []
+
+        for raw_line in name_status_output.splitlines():
+            raw_line = raw_line.strip()
+
+            if not raw_line:
+                continue
+
+            parts = raw_line.split("\t")
+            status = parts[0].strip()
+
+            # R100 / R092 / C100 这类状态只取首字母判断。
+            status_key = status[:1]
+            status_text = status_map.get(status_key, status)
+
+            if status_key == "R" and len(parts) >= 3:
+                lines.append(f"- {status_text}：{parts[1]}  →  {parts[2]}")
+            elif status_key == "C" and len(parts) >= 3:
+                lines.append(f"- {status_text}：{parts[1]}  →  {parts[2]}")
+            elif len(parts) >= 2:
+                lines.append(f"- {status_text}：{parts[1]}")
+            else:
+                lines.append(f"- {raw_line}")
+
+        return "\n".join(lines) if lines else "未检测到具体文件差异。"
+
+    def get_remote_changed_files_detail(self, repo):
+        """
+        查看本地 HEAD 到远程上游 @{u} 之间变化的文件。
+        注意：调用前应先 git fetch。
+        """
+        code, output = self.run_command_with_code(
+            ["git", "diff", "--name-status", "HEAD..@{u}"],
+            repo
+        )
+
+        if code != 0:
+            return "获取远程变化文件失败：\n" + output.strip()
+
+        return self.format_remote_changed_files_detail(output)
+
     def git_check_sync_status(self, auto=False):
         repo = self.get_repo_silent() if auto else self.get_repo()
         if not repo:
@@ -5282,6 +5341,10 @@ obj/
                 ))
                 return
 
+            remote_files_detail = ""
+            if behind > 0:
+                remote_files_detail = self.get_remote_changed_files_detail(repo)
+
             self.after(0, lambda: self.handle_sync_result(
                 auto=auto,
                 ok=True,
@@ -5289,7 +5352,7 @@ obj/
                 upstream=upstream_output,
                 ahead=ahead,
                 behind=behind,
-                detail=""
+                detail=remote_files_detail
             ))
 
         threading.Thread(target=task, daemon=True).start()
@@ -5312,6 +5375,10 @@ obj/
 
         info = f"远程上游：{upstream}\n本地领先：{ahead} 个提交\n本地落后：{behind} 个提交\n"
 
+        if behind > 0 and detail:
+            info += "\nGitHub 上比本地更新的文件：\n"
+            info += detail + "\n"
+
         if not auto:
             self.append_output(info)
 
@@ -5322,10 +5389,14 @@ obj/
             return
 
         if ahead == 0 and behind > 0:
-            self.status_text.set(f"本地落后 GitHub {behind} 个提交")
+            self.status_text.set(f"本地落后 GitHub {behind} 个提交，已显示远程变更文件")
+
+            file_text = detail if detail else "未获取到具体文件差异。"
             should_pull = messagebox.askyesno(
                 "本地版本落后",
-                f"检测到 GitHub 上有 {behind} 个新提交，本地版本落后。\n\n是否现在执行 git pull 拉取更新？"
+                f"检测到 GitHub 上有 {behind} 个新提交，本地版本落后。\n\n"
+                f"GitHub 上比本地更新的文件：\n{file_text}\n\n"
+                f"是否现在执行 git pull 拉取更新？"
             )
             if should_pull:
                 self.run_git(["pull"], "拉取 GitHub 更新")
@@ -5341,12 +5412,14 @@ obj/
                 self.git_smart_push()
             return
 
-        self.status_text.set(f"本地和 GitHub 已分叉：领先 {ahead}，落后 {behind}")
+        self.status_text.set(f"本地和 GitHub 已分叉：领先 {ahead}，落后 {behind}，已显示远程变更文件")
+        file_text = detail if detail else "未获取到具体文件差异。"
         messagebox.showwarning(
             "分支已分叉",
             f"本地和 GitHub 都有新的提交：\n\n"
             f"本地领先：{ahead} 个提交\n"
             f"本地落后：{behind} 个提交\n\n"
+            f"GitHub 上比本地更新的文件：\n{file_text}\n\n"
             f"建议先手动处理冲突风险，再执行拉取或合并操作。"
         )
 
