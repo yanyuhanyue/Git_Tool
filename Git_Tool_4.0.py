@@ -64,6 +64,10 @@ class GitGuiApp(tk.Tk):
         self.button_key_by_widget = {}
         self.button_widget_by_key = {}
 
+        # 避免同一个仓库反复弹出 LF/CRLF 自动修复提示
+        self.crlf_warning_prompted_repos = set()
+        self.is_running_line_ending_fix = False
+
         self.app_config = self.load_app_config()
 
         self.create_widgets()
@@ -1268,10 +1272,14 @@ obj/
         self.output.tag_config("normal_text", foreground="black", underline=False)
         self.output.tag_config("warning_text", foreground="#7a4b00", background="#fff3a3", underline=False)
         self.output.tag_config("error_text", foreground="#b00020", background="#ffd6d6", underline=False)
+        self.output.tag_config("status_file_text", foreground="black", font=("Consolas", 11, "bold"), underline=False)
         self.output.tag_config("commit_link", foreground="blue", underline=True)
         self.output.tag_raise("commit_link", "normal_text")
         self.output.tag_raise("commit_link", "warning_text")
+        self.output.tag_raise("error_text", "normal_text")
+        self.output.tag_raise("commit_link", "warning_text")
         self.output.tag_raise("commit_link", "error_text")
+        self.output.tag_raise("commit_link", "status_file_text")
 
         self.output.tag_bind("commit_link", "<Enter>", self.enter_commit_link)
         self.output.tag_bind("commit_link", "<Leave>", self.leave_commit_link)
@@ -3601,9 +3609,17 @@ obj/
 
         return any(pattern in lower_line for pattern in warning_patterns)
 
+    def is_crlf_warning_text(self, text):
+        lower_text = text.lower()
+        return (
+            "lf will be replaced by crlf" in lower_text
+            or "crlf will be replaced by lf" in lower_text
+        )
+
     def append_output(self, text):
         has_warning = False
         has_error = False
+        has_crlf_warning = self.is_crlf_warning_text(text)
 
         for chunk in text.splitlines(True):
             if self.is_error_line(chunk):
@@ -3620,7 +3636,37 @@ obj/
         elif has_warning:
             self.status_text.set("检测到 warning，已用黄色高亮显示")
 
+        if has_crlf_warning:
+            self.after(100, self.prompt_fix_crlf_warning_if_needed)
+
         self.output.see("end")
+
+    def prompt_fix_crlf_warning_if_needed(self):
+        if self.is_running_line_ending_fix:
+            return
+
+        repo = self.get_repo_silent()
+        repo_key = str(Path(repo).resolve()) if repo else "__no_repo__"
+
+        if repo_key in self.crlf_warning_prompted_repos:
+            return
+
+        self.crlf_warning_prompted_repos.add(repo_key)
+
+        message = (
+            "检测到 Windows 换行符警告：\n\n"
+            "warning: LF will be replaced by CRLF the next time Git touches it\n\n"
+            "建议处理方式：\n"
+            "1. 自动写入 / 更新 .gitattributes\n"
+            "2. 当前仓库设置 core.autocrlf=false\n"
+            "3. 由 .gitattributes 统一管理不同文件的换行符\n\n"
+            "是否现在执行“修复换行符警告”？"
+        )
+
+        if messagebox.askyesno("检测到换行符 warning", message):
+            self.git_fix_line_endings_windows()
+        else:
+            self.status_text.set("已忽略本次换行符 warning；可在“显示隐藏”中打开“修复换行符警告”按钮手动处理")
 
     def clear_output(self):
         self.output.delete("1.0", "end")
@@ -4031,7 +4077,89 @@ obj/
         return re.sub(r'[<>:"/\\|?*]+', "_", name)
 
     def git_status(self):
-        self.run_git(["status"], "查看仓库状态")
+        repo = self.get_repo()
+        if not repo:
+            return
+
+        self.append_output("\n========== 查看仓库状态 ==========\n")
+        self.append_output("git status\n\n")
+        self.status_text.set("正在查看仓库状态...")
+
+        def task():
+            code, output = self.run_command_with_code(["git", "status"], repo)
+            self.after(0, lambda: self.show_status_output_with_highlight(output, code, repo))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def is_git_status_file_line(self, line):
+        stripped = line.strip()
+
+        if not stripped:
+            return False
+
+        if stripped.startswith("("):
+            return False
+
+        if stripped.startswith("use "):
+            return False
+
+        status_prefixes = (
+            "modified:",
+            "new file:",
+            "deleted:",
+            "renamed:",
+            "copied:",
+            "typechange:",
+            "both modified:",
+            "both added:",
+            "both deleted:",
+            "unmerged:",
+        )
+
+        if stripped.startswith(status_prefixes):
+            return True
+
+        # git status 中未跟踪文件一般是缩进后只显示文件名
+        if (line.startswith("\t") or line.startswith("        ")) and not stripped.startswith("("):
+            return True
+
+        # 兼容简短状态输出格式
+        if re.match(r"^\s*[MADRCU?]{1,2}\s+.+", line):
+            return True
+
+        return False
+
+    def show_status_output_with_highlight(self, output, code, repo):
+        has_warning = False
+        has_error = False
+        has_crlf_warning = self.is_crlf_warning_text(output)
+
+        for line in output.splitlines(True):
+            if self.is_error_line(line):
+                self.output.insert("end-1c", line, ("error_text",))
+                has_error = True
+            elif self.is_warning_line(line):
+                self.output.insert("end-1c", line, ("warning_text",))
+                has_warning = True
+            elif self.is_git_status_file_line(line):
+                self.output.insert("end-1c", line, ("status_file_text",))
+            else:
+                self.output.insert("end-1c", line, ("normal_text",))
+
+        self.output.see("end")
+
+        if code == 0:
+            self.update_first_commit_step_status(repo, True, "查看状态")
+        else:
+            self.status_text.set("查看状态失败：请查看红色错误提示")
+
+        if has_error:
+            self.status_text.set("查看状态时检测到 error / fatal，已用红色高亮显示")
+        elif has_warning:
+            self.status_text.set("查看状态时检测到 warning，已用黄色高亮显示")
+
+        if has_crlf_warning:
+            self.after(100, self.prompt_fix_crlf_warning_if_needed)
 
     def git_add_all(self):
         self.run_git(["add", "."], "添加全部文件")
@@ -4736,6 +4864,8 @@ obj/
             messagebox.showerror("错误", "当前仓库路径不存在")
             return
 
+        self.is_running_line_ending_fix = True
+
         message = (
             "该功能用于修复 Windows 下常见提示：\n\n"
             "warning: LF will be replaced by CRLF the next time Git touches it\n\n"
@@ -4748,6 +4878,7 @@ obj/
         )
 
         if not messagebox.askyesno("修复 Windows 换行符警告", message):
+            self.is_running_line_ending_fix = False
             return
 
         gitattributes_path = Path(repo) / ".gitattributes"
@@ -4765,6 +4896,7 @@ obj/
                 gitattributes_path.write_text(block.lstrip(), encoding="utf-8")
 
         except Exception as e:
+            self.is_running_line_ending_fix = False
             messagebox.showerror("错误", f"写入 .gitattributes 失败：\n{e}")
             return
 
@@ -4784,6 +4916,7 @@ obj/
             self.append_output(output2 + "\n")
 
         if code1 != 0 or code2 != 0:
+            self.is_running_line_ending_fix = False
             messagebox.showwarning(
                 "提示",
                 "换行符规则文件已写入，但 Git 配置命令可能没有全部执行成功。\n请查看输出区域。"
@@ -4810,6 +4943,7 @@ obj/
                 "3. 点击“推送至仓库”\n"
             )
 
+        self.is_running_line_ending_fix = False
         self.status_text.set("Windows 换行符警告修复已完成")
 
     def git_fix_chinese(self):
