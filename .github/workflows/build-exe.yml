@@ -26,9 +26,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller
 
+      - name: 查看当前目录文件
+        run: |
+          Get-ChildItem
+
       - name: 打包 EXE
         run: |
-          pyinstaller --noconfirm --onefile --windowed --name Git_Tool Git_Tool_5.1.4.py
+          pyinstaller --noconfirm --onefile --windowed --name Git_Tool Git_Tool.py
 
       - name: 上传打包文件到 Actions Artifacts
         uses: actions/upload-artifact@v4
