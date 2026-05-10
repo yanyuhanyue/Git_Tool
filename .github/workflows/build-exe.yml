@@ -1,0 +1,43 @@
+name: Build Windows EXE
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: 拉取仓库代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装 PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+
+      - name: 打包 EXE
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name Git_Tool Git_Tool_5.1.4.py
+
+      - name: 上传打包文件到 Actions Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Git_Tool_Windows_EXE
+          path: dist/Git_Tool.exe
+
+      - name: 发布到 GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" "dist/Git_Tool.exe" --title "Git Tool ${{ github.ref_name }}" --notes "自动打包发布的 Windows EXE"
