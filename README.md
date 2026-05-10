@@ -377,33 +377,6 @@ Git_Tool/
 
 ---
 
-## 仓库描述推荐
-
-GitHub 仓库 Description 可以填写：
-
-```text
-一个面向新手的 Git 图形化自动工具，支持一键上传 GitHub、仓库初始化、状态查看、日志查看、版本恢复、分支切换、.gitignore 生成、布局自定义等常用操作，已打包为 Windows EXE，可直接运行。
-```
-
----
-
-## Topics 推荐
-
-```text
-git
-github
-tkinter
-python
-gui
-windows
-exe
-git-tool
-git-gui
-automation
-```
-
----
-
 ## 注意事项
 
 1. 使用前请先安装 Git。
@@ -417,5 +390,6 @@ automation
 
 ## 许可证
 
-如果希望别人可以自由使用、学习和修改本项目，建议添加 MIT License。  
-如果只是个人学习项目，也可以暂时不添加许可证。
+本项目采用 **MIT License** 开源协议。
+
+你可以自由使用、复制、修改、合并、发布、分发本项目代码，但需要保留原始版权声明和许可证声明。
